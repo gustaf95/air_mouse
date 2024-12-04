@@ -1,21 +1,14 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPU6050.h>
-#include <MadgwickAHRS.h>
 #include <BleMouse.h>
 
 MPU6050 mpu;
-Madgwick filter;
 BleMouse bleMouse("ESP32_AirMouse");  // BLEMouse -> BleMouse
 
-#define FILTER_TYPE 7  // 7: Madgwick + Adaptive Kalman + Savitzky-Golay Filter
+#define FILTER_TYPE 7  // 7: Complementary Filter + Savitzky-Golay Filter
 
-// Kalman Filter parameters
-float adaptiveKalmanAngleX = 0, adaptiveKalmanAngleY = 0, adaptiveKalmanAngleZ = 0;
-float P[3][2][2] = {{{0.01, 0}, {0, 0.01}}, {{0.01, 0}, {0, 0.01}}, {{0.01, 0}, {0, 0.01}}}; // Adjusted after calibration
-float R = 0.01;  // Measurement noise covariance
-float Q_angle = 0.001;  // Process noise covariance for the angle
-float Q_gyro = 0.003;   // Process noise covariance for the gyro
+#define DBG_COMP_FILTER 1
 
 // Savitzky-Golay filter parameters
 #define SG_ORDER 9  // Number of coefficients
@@ -29,6 +22,12 @@ unsigned long timer = 0;
 
 // Calibration variables
 float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
+
+// Complementary Filter parameters
+float compAngleX = 0, compAngleY = 0, compAngleZ = 0;
+float alpha = 0.9996;
+
+float prevCompAngleX = 0, prevCompAngleY = 0, prevCompAngleZ = 0;
 
 void calibrateSensors() {
   const int calibrationSamples = 1000;
@@ -53,9 +52,9 @@ void calibrateSensors() {
   // Calculate initial angles from accelerometer
   int16_t ax, ay, az;
   mpu.getAcceleration(&ax, &ay, &az);
-  adaptiveKalmanAngleX = atan2(ay, az) * 180 / PI;
-  adaptiveKalmanAngleY = atan2(ax, az) * 180 / PI;
-  adaptiveKalmanAngleZ = 0;  // Assuming initial Z angle is 0
+  compAngleX = atan2(ay, az) * 180 / PI;
+  compAngleY = atan2(ax, az) * 180 / PI;
+  compAngleZ = 0;  // Assuming initial Z angle is 0
 
   Serial.println("Calibration completed.");
   Serial.println(gyroBiasX);
@@ -63,35 +62,6 @@ void calibrateSensors() {
   Serial.println(gyroBiasZ);
 }
 
-// Adaptive Kalman Filter function
-float adaptiveKalmanFilter(float accelAngle, float gyroRate, float dt, float &adaptiveKalmanAngle, float P[2][2]) {
-  // Predict error covariance matrix P
-  float Pdot[2] = {Q_angle - P[0][1] - P[1][0], -P[1][1]};
-  P[0][0] += Pdot[0] * dt;
-  P[0][1] += Pdot[1] * dt;
-  P[1][0] += Pdot[1] * dt;
-  P[1][1] += Q_gyro * dt;
-
-  // Calculate Kalman gain
-  float S = P[0][0] + R;
-  float K[2] = {P[0][0] / S, P[1][0] / S};
-
-  // Update angle with measurement
-  float y = accelAngle - adaptiveKalmanAngle;
-  adaptiveKalmanAngle += K[0] * y;
-
-  // Update error covariance matrix P
-  float P00_temp = P[0][0];
-  float P01_temp = P[0][1];
-  P[0][0] -= K[0] * P00_temp;
-  P[0][1] -= K[0] * P01_temp;
-  P[1][0] -= K[1] * P00_temp;
-  P[1][1] -= K[1] * P01_temp;
-
-  return adaptiveKalmanAngle;
-}
-
-// Savitzky-Golay Filter function
 float savitzkyGolayFilter(float currentValue, float buffer[]) {
   // Shift buffer values to the right
   for (int i = SG_ORDER - 1; i > 0; i--) {
@@ -117,74 +87,69 @@ void setup() {
     while (1);
   }
   bleMouse.begin();
-  filter.begin(50);  // Initialize Madgwick filter with sampling rate of 50 Hz
-  
+
   calibrateSensors();
 
   timer = micros();
 }
 
 char buffer[200] = {0,};
-float prevMadgwickX = 0, prevMadgwickY = 0, prevMadgwickZ = 0;
 
 void loop() {
   int16_t ax, ay, az, gx, gy, gz;
   mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
-  Serial.print(">"); //for using serial-plotter
-  
+  Serial.print(">"); // for using serial-plotter
+
   // Convert gyroscope values to degrees/sec and remove bias
-  float gyroXrate = ((gx / 131.0) - gyroBiasX) * (PI / 180);
-  float gyroYrate = ((gy / 131.0) - gyroBiasY) * (PI / 180);
-  float gyroZrate = ((gz / 131.0) - gyroBiasZ) * (PI / 180);
-  sprintf(buffer, "gyroXrate:%f,gyroYrate:%f,gyroZrate:%f,", gyroXrate, gyroYrate, gyroZrate);
+  float gyroXrate = ((gx / 131.0) - gyroBiasX);
+  float gyroYrate = ((gy / 131.0) - gyroBiasY);
+  float gyroZrate = ((gz / 131.0) - gyroBiasZ);
+  sprintf(buffer, "gyroXrate:%f,gyroYrate:%f,", gyroXrate, gyroYrate);
   Serial.print(buffer);
 
   // Time difference
   float dt = (micros() - timer) / 1000000.0;
   timer = micros();
 
-  // Step 1: Apply Madgwick Filter
-  // Convert accelerometer values to g-force units
-  float ax_g = ax / 16384.0;
-  float ay_g = ay / 16384.0;
-  float az_g = az / 16384.0;
-  
-  // Apply Madgwick Filter with correct units for accelerometer and gyroscope
-  filter.updateIMU(gyroXrate, gyroYrate, gyroZrate, ax_g, ay_g, az_g);
-  float madgwickX = filter.getPitch();
-  float madgwickY = filter.getRoll();
-  float madgwickZ = filter.getYaw();
+  // Step 1: Apply Complementary Filter
+  float accelAngleX = atan2(ay, az) * 180 / PI;
+  float accelAngleY = atan2(ax, az) * 180 / PI;
+  float accelAngleZ = 0; // Assuming no direct calculation for Z angle from accelerometer
 
+  compAngleX = alpha * (compAngleX + gyroXrate * dt) + (1.0 - alpha) * accelAngleX;
+  compAngleY = alpha * (compAngleY + gyroYrate * dt) + (1.0 - alpha) * accelAngleY;
+  compAngleZ = alpha * (compAngleZ + gyroZrate * dt) + (1.0 - alpha) * accelAngleZ;
+
+#if DBG_COMP_FILTER
   // Calculate derivatives to compare with gyroscope values
-  float madgwickX_rate = (madgwickX - prevMadgwickX) / dt;
-  float madgwickY_rate = (madgwickY - prevMadgwickY) / dt;
-  float madgwickZ_rate = (madgwickZ - prevMadgwickZ) / dt;
+  float compAngleX_rate = (compAngleX - prevCompAngleX) / dt;
+  float compAngleY_rate = (compAngleY - prevCompAngleY) / dt;
+  float compAngleZ_rate = (compAngleZ - prevCompAngleZ) / dt;
 
   // Update previous values for next iteration
-  prevMadgwickX = madgwickX;
-  prevMadgwickY = madgwickY;
-  prevMadgwickZ = madgwickZ;
+  prevCompAngleX = compAngleX;
+  prevCompAngleY = compAngleY;
+  prevCompAngleZ = compAngleZ;
 
   // Serial output to compare
-  sprintf(buffer, "madgwickX_rate:%f,madgwickY_rate:%f,madgwickZ_rate:%f", madgwickX_rate, madgwickY_rate, madgwickZ_rate);
+  sprintf(buffer, "compAngleX_rate:%f,compAngleY_rate:%f,", compAngleX_rate, compAngleY_rate);
   Serial.print(buffer);
+#endif //DBG_COMP_FILTER
 
-  // Step 2: Apply Adaptive Kalman Filter
-  float filteredX = adaptiveKalmanFilter(madgwickX, gyroXrate, dt, adaptiveKalmanAngleX, P[0]);
-  float filteredY = adaptiveKalmanFilter(madgwickY, gyroYrate, dt, adaptiveKalmanAngleY, P[1]);
-  float filteredZ = adaptiveKalmanFilter(madgwickZ, gyroZrate, dt, adaptiveKalmanAngleZ, P[2]);
+  // Step 2: Apply Savitzky-Golay Filter
+  float filteredX = savitzkyGolayFilter(compAngleX_rate, sgBufferX);
+  float filteredY = savitzkyGolayFilter(compAngleY_rate, sgBufferY);
+  float filteredZ = savitzkyGolayFilter(compAngleZ_rate, sgBufferZ);
 
-  // Step 3: Apply Savitzky-Golay Filter
-  filteredX = savitzkyGolayFilter(filteredX, sgBufferX);
-  filteredY = savitzkyGolayFilter(filteredY, sgBufferY);
-  filteredZ = savitzkyGolayFilter(filteredZ, sgBufferZ);
+  // Serial output to compare
+  sprintf(buffer, "filteredX:%f,filteredY:%f", filteredX, filteredY);
+  Serial.print(buffer);
+  Serial.println("");
 
   if (bleMouse.isConnected()) {
-    bleMouse.move(filteredZ / 128.0, -filteredX / 128.0, 0, 0);
+    bleMouse.move(filteredY / 4.0, -filteredX / 4.0, 0, 0);
   }
 
-  Serial.println("");
   delay(20); // Loop delay
 }
-
